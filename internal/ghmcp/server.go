@@ -17,6 +17,7 @@ import (
 	"github.com/github/github-mcp-server/pkg/github"
 	mcplog "github.com/github/github-mcp-server/pkg/log"
 	"github.com/github/github-mcp-server/pkg/raw"
+	"github.com/github/github-mcp-server/pkg/repository"
 	"github.com/github/github-mcp-server/pkg/translations"
 	gogithub "github.com/google/go-github/v74/github"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -262,6 +263,92 @@ func RunStdioServer(cfg StdioServerConfig) error {
 			return fmt.Errorf("error running server: %w", err)
 		}
 	}
+
+	return nil
+}
+
+// RunRepositoryStdioServer runs the MCP server for repository analysis
+func RunRepositoryStdioServer(cfg StdioServerConfig) error {
+	// Create app context
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Create MCP server for repository tools
+	repoServer := server.NewMCPServer(
+		"mcp-prime",
+		cfg.Version,
+		server.WithToolCapabilities(true),
+		server.WithLogging(),
+	)
+
+	// Register repository tools
+	err := registerRepositoryTools(repoServer)
+	if err != nil {
+		return fmt.Errorf("failed to register repository tools: %w", err)
+	}
+
+	stdioServer := server.NewStdioServer(repoServer)
+
+	var slogHandler slog.Handler
+	var logOutput io.Writer
+	if cfg.LogFilePath != "" {
+		file, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		logOutput = file
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		logOutput = os.Stderr
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	logger := slog.New(slogHandler)
+	logger.Info("starting MCP PRIME server", "version", cfg.Version)
+	stdLogger := log.New(logOutput, "[MCP-PRIME] ", 0)
+	stdioServer.SetErrorLogger(stdLogger)
+
+	// Start listening for messages
+	errC := make(chan error, 1)
+	go func() {
+		in, out := io.Reader(os.Stdin), io.Writer(os.Stdout)
+
+		if cfg.EnableCommandLogging {
+			loggedIO := mcplog.NewIOLogger(in, out, logger)
+			in, out = loggedIO, loggedIO
+		}
+		errC <- stdioServer.Listen(ctx, in, out)
+	}()
+
+	// Output server info
+	_, _ = fmt.Fprintf(os.Stderr, "MCP PRIME Server running on stdio\n")
+
+	// Wait for shutdown signal
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down server", "signal", "context done")
+	case err := <-errC:
+		if err != nil {
+			logger.Error("error running server", "error", err)
+			return fmt.Errorf("error running server: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func registerRepositoryTools(mcpServer *server.MCPServer) error {
+	// Register repository analysis tools directly
+	fileListTool, fileListHandler := repository.GetFileListTool()
+	mcpServer.AddTool(fileListTool, fileListHandler)
+
+	fileContentTool, fileContentHandler := repository.GetFileContentTool()
+	mcpServer.AddTool(fileContentTool, fileContentHandler)
+
+	extractSigTool, extractSigHandler := repository.ExtractSignaturesTool()
+	mcpServer.AddTool(extractSigTool, extractSigHandler)
+
+	emitToolTool, emitToolHandler := repository.EmitToolJSONTool()
+	mcpServer.AddTool(emitToolTool, emitToolHandler)
 
 	return nil
 }
